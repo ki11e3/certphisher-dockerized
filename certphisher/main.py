@@ -10,33 +10,35 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 import re
-import configparser
-import certstream
+import math
 import entropy
-import tqdm
-import yaml
+import configparser
 import sqlite3
-import time
 import pymongo
-import socket
 import json
-
 import requests
-from sitereview import SiteReview
 import safebrowsing
-
+import socket
 from pydnsbl import DNSBLChecker
 
-from bson.binary import Binary
+
+import certstream
+import tqdm
+import yaml
+import time
+import os
 from Levenshtein import distance
 from termcolor import colored, cprint
 from tld import get_tld
+
+from bson.binary import Binary
 from urlscan import UrlScan
-from confusables import unconfuse
 from tldextract import extract
-from slackclient import SlackClient
 
+from confusables import unconfuse
+from sitereview import SiteReview
 
+#Config Parse Start
 config = configparser.ConfigParser()
 config.read('config.ini')
 
@@ -51,9 +53,18 @@ mydb = myclient[config.get("mongodb", "my_db")]
 mycol = mydb[config.get("mongodb", "my_col")]
 
 slack_token = config.get('slack', 'bot_key')
-sc = SlackClient(slack_token)
+#sc = SlackClient(slack_token)
+
+#Config Parse End
+
 
 certstream_url = 'wss://certstream.calidog.io'
+
+log_suspicious = os.path.dirname(os.path.realpath(__file__))+'/suspicious_domains_'+time.strftime("%Y-%m-%d")+'.log'
+
+suspicious_yaml = os.path.dirname(os.path.realpath(__file__))+'/suspicious.yaml'
+
+external_yaml = os.path.dirname(os.path.realpath(__file__))+'/external.yaml'
 
 pbar = tqdm.tqdm(desc='certificate_update', unit='cert')
 
@@ -83,7 +94,7 @@ def urlhaus_url_check(domain, siteid):
     site_record = { "_id":  siteid }
     response_data = { "$set": {"urlhaus": {"url_check": json_response }}}
     mycol.update_one(site_record, response_data)
-    
+
 def urlhaus_domain_check(domain, domain_ip, siteid):
     url = 'https://urlhaus-api.abuse.ch/v1/host/'
     params = {'host':  domain}
@@ -102,7 +113,6 @@ def urlhaus_host_check(domain, domain_ip, siteid):
     response_data = { "$set": {"urlhaus": {"host_check": json_response }}}
     mycol.update_one(site_record, response_data)
 
-    
 def vt_scan(domain, siteid):
     time.sleep(26)
     url = 'https://www.virustotal.com/vtapi/v2/url/scan'
@@ -120,6 +130,7 @@ def vt_scan(domain, siteid):
         print("upload failed.")
       
     return json_response.get("permalink")
+
 def get_domain_tld(domain):
     td, tsu = extract("https://"+domain) # prints domain, tld
     url = td + '.' + tsu # will prints as hostname.com       
@@ -186,11 +197,24 @@ def save_url(domain, score, ca):
     #vt_domain_report(domain, siteid)
     return True
 
+
+
+
+
+def entropy(string):
+    """Calculates the Shannon entropy of a string"""
+    prob = [ float(string.count(c)) / len(string) for c in dict.fromkeys(list(string)) ]
+    entropy = - sum([ p * math.log(p) / math.log(2.0) for p in prob ])
+    return entropy
+
 def score_domain(domain):
     """Score `domain`.
+
     The highest score, the most probable `domain` is a phishing site.
+
     Args:
         domain (str): the domain to check.
+
     Returns:
         int: the score of `domain`.
     """
@@ -199,21 +223,28 @@ def score_domain(domain):
         if domain.endswith(t):
             score += 20
 
-    # Higher entropy is kind of suspicious
-    score += int(round(entropy.shannon_entropy(domain)*50))
+    # Remove initial '*.' for wildcard certificates bug
+    if domain.startswith('*.'):
+        domain = domain[2:]
+
+    # Removing TLD to catch inner TLD in subdomain (ie. paypal.com.domain.com)
+    try:
+        res = get_tld(domain, as_object=True, fail_silently=True, fix_protocol=True)
+        domain = '.'.join([res.subdomain, res.domain])
+    except Exception:
+        pass
+
+    # Higer entropy is kind of suspicious
+    score += int(round(entropy(domain)*10))
 
     # Remove lookalike characters using list from http://www.unicode.org/reports/tr39
     domain = unconfuse(domain)
 
     words_in_domain = re.split("\W+", domain)
 
-    # Remove initial '*.' for wildcard certificates bug
-    if domain.startswith('*.'):
-        domain = domain.replace("*.","")
-
-        # ie. detect fake .com (ie. *.com-account-management.info)
-        if words_in_domain[0] in ['com', 'net', 'org']:
-            score += 10
+    # ie. detect fake .com (ie. *.com-account-management.info)
+    if words_in_domain[0] in ['com', 'net', 'org']:
+        score += 10
 
     # Testing keywords
     for word in suspicious['keywords']:
@@ -237,42 +268,6 @@ def score_domain(domain):
 
     return score
 
-def callback(message, context):
-    """Callback handler for certstream events."""
-    if message['message_type'] == "heartbeat":
-        return
-
-    if message['message_type'] == "certificate_update":
-        all_domains = message['data']['leaf_cert']['all_domains']
-        ca = message['data']['chain'][0]['subject']['CN']
-            
-        for domain in all_domains:
-            if "STH" in domain:
-                continue
-            domain = domain.replace("*.","")
-            pbar.update(1)
-            
-            score = score_domain(domain)
-            # If issued from a free CA = more suspicious
-            if "Let's Encrypt" in message['data']['chain'][0]['subject']['aggregated']:
-                score += 10
-
-            if score >= 100:
-                tqdm.tqdm.write(
-                    "[!] Suspicious: "
-                    "{} (score={})".format(colored(domain, 'red', attrs=['underline', 'bold']), score))
-                save_url(domain, score, ca )
-            elif score >= 90:
-                tqdm.tqdm.write(
-                    "[!] Likely: "
-                    "{} (score={})".format(colored(domain, 'red', attrs=['underline']), score))
-                save_url(domain, score, ca )
-            elif score >= 80:
-                tqdm.tqdm.write(
-                    "[!] Likely    : "
-                    "{} (score={})".format(colored(domain, 'yellow', attrs=['underline']), score))
-            
-        
 def send_slack_message(domain, score, ca, permalink, reportpage):
     #Send message in channel
 
@@ -287,12 +282,49 @@ def send_slack_message(domain, score, ca, permalink, reportpage):
     except:
         print("Debug: Error in send_to_slack.")
 
+def callback(message, context):
+    """Callback handler for certstream events."""
+    if message['message_type'] == "heartbeat":
+        return
+
+    if message['message_type'] == "certificate_update":
+        all_domains = message['data']['leaf_cert']['all_domains']
+
+        for domain in all_domains:
+            pbar.update(1)
+            score = score_domain(domain.lower())
+
+            # If issued from a free CA = more suspicious
+            if "Let's Encrypt" == message['data']['leaf_cert']['issuer']['O']:
+                score += 10
+
+            if score >= 100:
+                tqdm.tqdm.write(
+                    "[!] Suspicious: "
+                    "{} (score={})".format(colored(domain, 'red', attrs=['underline', 'bold']), score))
+            elif score >= 90:
+                tqdm.tqdm.write(
+                    "[!] Suspicious: "
+                    "{} (score={})".format(colored(domain, 'red', attrs=['underline']), score))
+            elif score >= 80:
+                tqdm.tqdm.write(
+                    "[!] Likely    : "
+                    "{} (score={})".format(colored(domain, 'yellow', attrs=['underline']), score))
+            elif score >= 65:
+                tqdm.tqdm.write(
+                    "[+] Potential : "
+                    "{} (score={})".format(colored(domain, attrs=['underline']), score))
+
+            if score >= 75:
+                with open(log_suspicious, 'a') as f:
+                    f.write("{}\n".format(domain))
+
 
 if __name__ == '__main__':
-    with open('suspicious.yaml', 'r') as f:
+    with open(suspicious_yaml, 'r') as f:
         suspicious = yaml.safe_load(f)
 
-    with open('external.yaml', 'r') as f:
+    with open(external_yaml, 'r') as f:
         external = yaml.safe_load(f)
 
     if external['override_suspicious.yaml'] is True:
@@ -304,6 +336,4 @@ if __name__ == '__main__':
         if external['tlds'] is not None:
             suspicious['tlds'].update(external['tlds'])
 
-    
-    #create_connection("certphisher.db") 
     certstream.listen_for_events(callback, url=certstream_url)
